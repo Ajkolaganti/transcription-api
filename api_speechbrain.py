@@ -15,7 +15,7 @@ import tempfile
 import time
 import torch
 import torchaudio
-from speechbrain.pretrained import EncoderClassifier
+from speechbrain.inference.speaker import EncoderClassifier
 
 # Create FastAPI app
 app = FastAPI(
