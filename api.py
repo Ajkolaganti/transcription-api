@@ -10,8 +10,9 @@ from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from transcribe import transcribe_with_speakers
+from transcribe import transcribe_with_speakers, TranscriptionService
 import tempfile
+import asyncio
 
 # Create FastAPI app
 app = FastAPI(
@@ -19,6 +20,28 @@ app = FastAPI(
     description="Audio/Video transcription with speaker identification",
     version="1.0.0"
 )
+
+# Global service instance (lazy loaded)
+_service = None
+_service_error = None
+
+def get_service():
+    """Get or initialize the transcription service"""
+    global _service, _service_error
+    
+    if _service_error:
+        raise HTTPException(status_code=500, detail=f"Service initialization failed: {_service_error}")
+    
+    if _service is None:
+        try:
+            print("Initializing transcription service...")
+            _service = TranscriptionService(whisper_model="base")
+            print("Transcription service ready!")
+        except Exception as e:
+            _service_error = str(e)
+            raise HTTPException(status_code=500, detail=f"Failed to initialize service: {str(e)}")
+    
+    return _service
 
 # Upload directory
 UPLOAD_DIR = Path("uploads")
@@ -41,14 +64,52 @@ class TranscriptionResponse(BaseModel):
 @app.get("/")
 async def root():
     """Health check endpoint"""
+    hf_token_set = bool(os.environ.get("HF_TOKEN"))
+    service_ready = _service is not None
+    
     return {
         "status": "online",
         "service": "Transcription API",
         "version": "1.0.0",
+        "hf_token_configured": hf_token_set,
+        "models_loaded": service_ready,
+        "error": _service_error,
         "endpoints": {
-            "POST /transcribe": "Upload file for transcription"
+            "POST /transcribe": "Upload file for transcription",
+            "GET /ready": "Check if models are loaded"
         }
     }
+
+
+@app.get("/ready")
+async def ready_check():
+    """Check if service is fully initialized and ready"""
+    hf_token = os.environ.get("HF_TOKEN")
+    
+    if not hf_token:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ready": False,
+                "reason": "HF_TOKEN environment variable not set. Add it in Railway dashboard."
+            }
+        )
+    
+    try:
+        service = get_service()
+        return {
+            "ready": True,
+            "models_loaded": True,
+            "whisper_model": "base"
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ready": False,
+                "reason": str(e)
+            }
+        )
 
 
 @app.post("/transcribe", response_model=TranscriptionResponse)
@@ -68,6 +129,13 @@ async def transcribe_endpoint(
     Returns:
         Transcription with speaker-labeled segments
     """
+    # Check HF token first
+    if not os.environ.get("HF_TOKEN"):
+        raise HTTPException(
+            status_code=503,
+            detail="Service not configured: HF_TOKEN environment variable missing. Set it in Railway dashboard."
+        )
+    
     # Validate file
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
@@ -83,6 +151,9 @@ async def transcribe_endpoint(
         with temp_file as f:
             shutil.copyfileobj(file.file, f)
         
+        # Initialize service if needed (lazy load on first request)
+        get_service()
+        
         # Process transcription
         result = transcribe_with_speakers(
             audio_path=temp_file.name,
@@ -92,6 +163,8 @@ async def transcribe_endpoint(
         
         return JSONResponse(content=result)
     
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,

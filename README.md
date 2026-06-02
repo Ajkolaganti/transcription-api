@@ -153,7 +153,21 @@ In Railway dashboard:
 - Go to your project → Variables
 - Add: `HF_TOKEN` = your HuggingFace token
 
-### 4. Get Your API URL
+**IMPORTANT:** Without HF_TOKEN, the API will return 503 errors!
+
+### 4. Wait for Model Download (First Deploy Only)
+The first deployment downloads ~2GB of models:
+- Whisper model (~500MB)
+- Pyannote diarization model (~1.5GB)
+
+This happens on first request, taking 2-3 minutes. Subsequent requests are instant.
+
+**Check readiness:**
+```bash
+curl https://your-app.up.railway.app/ready
+```
+
+### 5. Get Your API URL
 Railway provides a URL like: `https://transcription-api-production.up.railway.app`
 
 ### Notes
