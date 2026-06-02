@@ -129,6 +129,9 @@ async def transcribe_endpoint(
     Returns:
         Transcription with speaker-labeled segments
     """
+    import time
+    start_time = time.time()
+    
     # Check HF token first
     if not os.environ.get("HF_TOKEN"):
         raise HTTPException(
@@ -148,18 +151,35 @@ async def transcribe_endpoint(
     
     try:
         # Write uploaded content
+        upload_start = time.time()
         with temp_file as f:
             shutil.copyfileobj(file.file, f)
+        upload_time = time.time() - upload_start
+        
+        print(f"Upload took {upload_time:.2f}s for {file.filename}")
         
         # Initialize service if needed (lazy load on first request)
         get_service()
         
         # Process transcription
+        process_start = time.time()
         result = transcribe_with_speakers(
             audio_path=temp_file.name,
             language=language,
             whisper_model=model
         )
+        process_time = time.time() - process_start
+        
+        total_time = time.time() - start_time
+        
+        print(f"Processing took {process_time:.2f}s, total: {total_time:.2f}s")
+        
+        # Add timing info to response
+        result["timing"] = {
+            "upload_seconds": round(upload_time, 2),
+            "processing_seconds": round(process_time, 2),
+            "total_seconds": round(total_time, 2)
+        }
         
         return JSONResponse(content=result)
     
