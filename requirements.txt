@@ -14,7 +14,7 @@ python-multipart==0.0.12
 torch>=2.0.0,<2.5.0
 torchaudio>=2.0.0,<2.5.0
 numpy<2.0.0
-huggingface-hub>=0.23.0
+huggingface-hub<0.20.0
 
 # Production server
 gunicorn==21.2.0
