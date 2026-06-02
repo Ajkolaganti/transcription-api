@@ -204,7 +204,8 @@ async def ready_check():
 async def transcribe_endpoint(
     file: UploadFile = File(...),
     language: Optional[str] = Form(None),
-    enable_speakers: bool = Form(True)
+    enable_speakers: bool = Form(True),
+    translate_to_english: bool = Form(False)
 ):
     """
     Transcribe audio or video file with speaker identification
@@ -213,6 +214,7 @@ async def transcribe_endpoint(
         file: Audio/video file to transcribe
         language: Language code (en, es, fr, etc.) - optional, auto-detects
         enable_speakers: Enable speaker diarization (default: true)
+        translate_to_english: If true, translate to English (default: false)
     
     Returns:
         Transcription segments with timestamps and speaker labels
@@ -243,9 +245,14 @@ async def transcribe_endpoint(
         
         # Transcribe
         transcribe_start = time.time()
+        
+        # Choose task: transcribe (original language) or translate (to English)
+        task = "translate" if translate_to_english else "transcribe"
+        
         segments_iter, info = whisper.transcribe(
             temp_file.name,
             language=language,
+            task=task,
             vad_filter=True,
             word_timestamps=False
         )
