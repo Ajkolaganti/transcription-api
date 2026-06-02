@@ -1,8 +1,16 @@
 # Core transcription
 faster-whisper==1.0.3
 
+# Speaker diarization (SpeechBrain - no HF token needed!)
+speechbrain==1.0.0
+scikit-learn>=1.3.0
+
 # Audio processing
 pydub==0.25.1
+torchaudio>=2.0.0,<2.5.0
+
+# Deep learning
+torch>=2.0.0,<2.5.0
 
 # API framework
 fastapi==0.115.0
