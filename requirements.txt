@@ -1,6 +1,6 @@
 # Core transcription
 faster-whisper==1.0.3
-pyannote.audio==3.3.2
+pyannote.audio==3.1.1
 
 # Audio processing
 pydub==0.25.1
@@ -11,9 +11,10 @@ uvicorn[standard]==0.30.6
 python-multipart==0.0.12
 
 # Utilities
-torch>=2.0.0
-torchaudio>=2.0.0
+torch>=2.0.0,<2.5.0
+torchaudio>=2.0.0,<2.5.0
 numpy<2.0.0
+huggingface-hub>=0.23.0
 
 # Production server
 gunicorn==21.2.0
