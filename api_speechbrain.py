@@ -4,42 +4,67 @@ No HuggingFace token required!
 """
 
 import os
-import shutil
+import time
+import logging
+import tempfile
 from typing import Optional
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 from faster_whisper import WhisperModel
-import tempfile
-import time
+from pydantic import BaseModel
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 import torch
 import torchaudio
 from speechbrain.inference.speaker import EncoderClassifier
 
-# Create FastAPI app
+from security import (
+    limiter,
+    verify_api_key,
+    SecurityHeadersMiddleware,
+    validate_upload,
+    validate_language,
+    MAX_FILE_SIZE_BYTES,
+)
+
+logger = logging.getLogger(__name__)
+
 app = FastAPI(
     title="Transcription API with Speaker ID",
     description="Audio/Video transcription with speaker diarization (SpeechBrain)",
-    version="2.0.0"
+    version="2.0.0",
 )
 
-# Global models
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SecurityHeadersMiddleware)
+
+_allowed_origins = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",")]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["X-API-Key", "Content-Type"],
+)
+
 _whisper_model = None
 _speaker_model = None
 
+
 def get_whisper_model():
-    """Get or initialize Whisper model"""
     global _whisper_model
     if _whisper_model is None:
         print("Loading Whisper model (base)...")
         _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
-        print("✓ Whisper model ready!")
+        print("Whisper model ready!")
     return _whisper_model
 
 
 def get_speaker_model():
-    """Get or initialize SpeechBrain speaker recognition model"""
     global _speaker_model
     if _speaker_model is None:
         print("Loading SpeechBrain speaker model...")
@@ -47,9 +72,9 @@ def get_speaker_model():
             _speaker_model = EncoderClassifier.from_hparams(
                 source="speechbrain/spkrec-ecapa-voxceleb",
                 savedir="pretrained_models/spkrec-ecapa-voxceleb",
-                run_opts={"device": "cpu"}
+                run_opts={"device": "cpu"},
             )
-            print("✓ SpeechBrain model ready!")
+            print("SpeechBrain model ready!")
         except Exception as e:
             print(f"Warning: Could not load speaker model: {e}")
             _speaker_model = None
@@ -57,85 +82,54 @@ def get_speaker_model():
 
 
 def cluster_speaker_embeddings(embeddings, threshold=0.7):
-    """
-    Simple speaker clustering using cosine similarity
-    Returns speaker labels for each segment
-    """
+    """Simple cosine-similarity speaker clustering."""
     if not embeddings:
         return []
-    
+
     import numpy as np
     from sklearn.metrics.pairwise import cosine_similarity
-    
-    # Convert to numpy array
+
     emb_array = np.array(embeddings)
-    
-    # Compute similarity matrix
-    similarity = cosine_similarity(emb_array)
-    
-    # Simple clustering: assign to existing speaker if similarity > threshold
     speaker_labels = []
-    speakers = []  # List of speaker embeddings
-    
-    for i, emb in enumerate(emb_array):
+    speaker_centroids = []
+
+    for emb in emb_array:
         assigned = False
-        
-        # Check similarity with existing speakers
-        for speaker_idx, speaker_emb in enumerate(speakers):
-            sim = cosine_similarity([emb], [speaker_emb])[0][0]
-            if sim > threshold:
-                speaker_labels.append(f"SPEAKER_{speaker_idx}")
+        for idx, centroid in enumerate(speaker_centroids):
+            if cosine_similarity([emb], [centroid])[0][0] > threshold:
+                speaker_labels.append(f"SPEAKER_{idx}")
                 assigned = True
                 break
-        
-        # New speaker
         if not assigned:
-            speaker_idx = len(speakers)
-            speakers.append(emb)
-            speaker_labels.append(f"SPEAKER_{speaker_idx}")
-    
+            speaker_centroids.append(emb)
+            speaker_labels.append(f"SPEAKER_{len(speaker_centroids) - 1}")
+
     return speaker_labels
 
 
 def extract_speaker_embeddings(audio_path, segments):
-    """
-    Extract speaker embeddings for each segment
-    """
     speaker_model = get_speaker_model()
     if speaker_model is None:
         return None
-    
     try:
-        # Load audio
         waveform, sample_rate = torchaudio.load(audio_path)
-        
-        # Convert to mono if stereo
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
-        
+
         embeddings = []
-        
         for segment in segments:
-            start_sample = int(segment['start'] * sample_rate)
-            end_sample = int(segment['end'] * sample_rate)
-            
-            # Extract segment audio
-            segment_audio = waveform[:, start_sample:end_sample]
-            
-            # Skip very short segments (< 0.5 seconds)
-            if segment_audio.shape[1] < sample_rate * 0.5:
+            start_sample = int(segment["start"] * sample_rate)
+            end_sample = int(segment["end"] * sample_rate)
+            seg_audio = waveform[:, start_sample:end_sample]
+            if seg_audio.shape[1] < sample_rate * 0.5:
                 embeddings.append(None)
                 continue
-            
-            # Get embedding
             with torch.no_grad():
-                embedding = speaker_model.encode_batch(segment_audio)
-                embeddings.append(embedding.squeeze().cpu().numpy())
-        
+                emb = speaker_model.encode_batch(seg_audio)
+                embeddings.append(emb.squeeze().cpu().numpy())
         return embeddings
-    
     except Exception as e:
-        print(f"Warning: Speaker embedding extraction failed: {e}")
+        logger.warning("Speaker embedding extraction failed: %s", e)
         return None
 
 
@@ -153,149 +147,120 @@ class TranscriptionResponse(BaseModel):
 
 
 @app.get("/")
-async def root():
+@limiter.limit("30/minute")
+async def root(request: Request):
     """Health check endpoint"""
-    speaker_available = get_speaker_model() is not None
-    
     return {
         "status": "online",
         "service": "Transcription API with Speaker Identification",
         "version": "2.0.0",
         "features": {
             "transcription": "faster-whisper (base model)",
-            "speaker_diarization": "SpeechBrain ECAPA-TDNN" if speaker_available else "unavailable",
-            "authentication": "none required"
+            "speaker_diarization": "SpeechBrain ECAPA-TDNN" if _speaker_model else "not yet loaded",
         },
         "endpoints": {
             "GET /": "Service info",
             "GET /health": "Health check",
             "GET /ready": "Readiness check",
-            "POST /transcribe": "Upload file for transcription + speaker ID"
-        }
+            "POST /transcribe": "Upload file for transcription + speaker ID",
+        },
     }
 
 
 @app.get("/health")
-async def health_check():
+@limiter.limit("60/minute")
+async def health_check(request: Request):
     """Health check for monitoring"""
     return {"status": "healthy"}
 
 
 @app.get("/ready")
-async def ready_check():
+@limiter.limit("20/minute")
+async def ready_check(request: Request):
     """Check if service is ready"""
     try:
-        whisper = get_whisper_model()
-        speaker = get_speaker_model()
-        
+        get_whisper_model()
+        get_speaker_model()
         return {
             "ready": True,
             "whisper_model": "base",
-            "speaker_model": "speechbrain-ecapa" if speaker else "disabled"
+            "speaker_model": "speechbrain-ecapa" if _speaker_model else "disabled",
         }
     except Exception as e:
-        return JSONResponse(
-            status_code=503,
-            content={"ready": False, "reason": str(e)}
-        )
+        return JSONResponse(status_code=503, content={"ready": False, "reason": str(e)})
 
 
 @app.post("/transcribe", response_model=TranscriptionResponse)
+@limiter.limit("10/minute")
 async def transcribe_endpoint(
+    request: Request,
     file: UploadFile = File(...),
     language: Optional[str] = Form(None),
     enable_speakers: bool = Form(True),
-    translate_to_english: bool = Form(False)
+    translate_to_english: bool = Form(False),
+    _: None = Depends(verify_api_key),
 ):
     """
-    Transcribe audio or video file with speaker identification
-    
-    Args:
-        file: Audio/video file to transcribe
-        language: Language code (en, es, fr, etc.) - optional, auto-detects
-        enable_speakers: Enable speaker diarization (default: true)
-        translate_to_english: If true, translate to English (default: false)
-    
-    Returns:
-        Transcription segments with timestamps and speaker labels
+    Transcribe audio or video file with speaker identification.
+
+    - **file**: Audio/video file (max 100 MB by default)
+    - **language**: ISO 639-1 language code (optional; auto-detected if omitted)
+    - **enable_speakers**: Include speaker labels (default: true)
+    - **translate_to_english**: Translate output to English (default: false)
     """
-    start_time = time.time()
-    
-    # Validate file
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file provided")
-    
-    # Save uploaded file temporarily
-    temp_file = tempfile.NamedTemporaryFile(
-        delete=False, 
-        suffix=Path(file.filename).suffix
-    )
-    
+    safe_filename = validate_upload(file.filename or "")
+    validate_language(language)
+
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=Path(safe_filename).suffix)
+    temp_path = temp_file.name
+    temp_file.close()
+
     try:
-        # Write uploaded content
         upload_start = time.time()
-        with temp_file as f:
-            shutil.copyfileobj(file.file, f)
+        bytes_written = 0
+        with open(temp_path, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                bytes_written += len(chunk)
+                if bytes_written > MAX_FILE_SIZE_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large. Maximum size is {MAX_FILE_SIZE_BYTES // (1024 * 1024)} MB.",
+                    )
+                f.write(chunk)
         upload_time = time.time() - upload_start
-        
-        print(f"Upload took {upload_time:.2f}s for {file.filename}")
-        
-        # Get Whisper model
+
+        logger.info("Uploaded %r (%d bytes) in %.2fs", safe_filename, bytes_written, upload_time)
+
         whisper = get_whisper_model()
-        
-        # Transcribe
+
         transcribe_start = time.time()
-        
-        # Choose task: transcribe (original language) or translate (to English)
         task = "translate" if translate_to_english else "transcribe"
-        
         segments_iter, info = whisper.transcribe(
-            temp_file.name,
-            language=language,
-            task=task,
-            vad_filter=True,
-            word_timestamps=False
+            temp_path, language=language, task=task, vad_filter=True, word_timestamps=False
         )
-        
-        # Collect segments
-        segments = []
-        for segment in segments_iter:
-            segments.append({
-                "start": segment.start,
-                "end": segment.end,
-                "text": segment.text.strip(),
-                "speaker": None
-            })
-        
+
+        segments = [
+            {"start": s.start, "end": s.end, "text": s.text.strip(), "speaker": None}
+            for s in segments_iter
+        ]
         transcribe_time = time.time() - transcribe_start
-        print(f"Transcription took {transcribe_time:.2f}s")
-        
-        # Speaker diarization
-        speaker_time = 0
+
+        speaker_time = 0.0
         if enable_speakers and segments:
             speaker_start = time.time()
-            print("Extracting speaker embeddings...")
-            
-            embeddings = extract_speaker_embeddings(temp_file.name, segments)
-            
+            embeddings = extract_speaker_embeddings(temp_path, segments)
             if embeddings:
-                # Filter out None embeddings
-                valid_indices = [i for i, emb in enumerate(embeddings) if emb is not None]
-                valid_embeddings = [emb for emb in embeddings if emb is not None]
-                
-                if valid_embeddings:
-                    speaker_labels = cluster_speaker_embeddings(valid_embeddings)
-                    
-                    # Assign labels back to segments
-                    label_idx = 0
-                    for i in range(len(segments)):
-                        if i in valid_indices:
-                            segments[i]["speaker"] = speaker_labels[label_idx]
-                            label_idx += 1
-            
+                valid_indices = [i for i, e in enumerate(embeddings) if e is not None]
+                valid_embs = [e for e in embeddings if e is not None]
+                if valid_embs:
+                    labels = cluster_speaker_embeddings(valid_embs)
+                    for pos, idx in enumerate(valid_indices):
+                        segments[idx]["speaker"] = labels[pos]
             speaker_time = time.time() - speaker_start
-            print(f"Speaker diarization took {speaker_time:.2f}s")
-        
+
         result = {
             "language": info.language,
             "duration": info.duration,
@@ -304,34 +269,30 @@ async def transcribe_endpoint(
                 "upload_seconds": round(upload_time, 2),
                 "transcription_seconds": round(transcribe_time, 2),
                 "speaker_seconds": round(speaker_time, 2),
-                "total_seconds": round(time.time() - start_time, 2)
-            }
+                "total_seconds": round(upload_time + transcribe_time + speaker_time, 2),
+            },
         }
-        
+
         return JSONResponse(content=result)
-    
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Transcription failed: {str(e)}"
-        )
-    
+
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Transcription error for %r", safe_filename)
+        raise HTTPException(status_code=500, detail="Transcription failed. See server logs.")
     finally:
-        # Cleanup
         file.file.close()
-        if os.path.exists(temp_file.name):
-            os.unlink(temp_file.name)
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 if __name__ == "__main__":
     import uvicorn
-    
-    print("\n" + "="*70)
+
+    print("\n" + "=" * 70)
     print("Starting Transcription API with Speaker Identification (SpeechBrain)")
-    print("="*70)
+    print("=" * 70)
     print("\nAPI Docs: http://localhost:8000/docs")
     print("Health Check: http://localhost:8000/health\n")
-    
+
     uvicorn.run(app, host="0.0.0.0", port=8000)

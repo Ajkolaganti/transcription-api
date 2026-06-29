@@ -17,6 +17,9 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-multipart==0.0.12
 
+# Security & rate limiting
+slowapi==0.1.9
+
 # Utilities
 numpy<2.0.0
 requests>=2.31.0
