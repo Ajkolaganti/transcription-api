@@ -42,7 +42,7 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SecurityHeadersMiddleware)
 
-_allowed_origins = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",")]
+_allowed_origins = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "https://voicecast-topaz.vercel.app").split(",")]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
